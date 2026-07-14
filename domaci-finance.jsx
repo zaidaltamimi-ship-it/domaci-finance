@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from "react";
 import {
   BarChart, Bar, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid, ReferenceLine,
+  PieChart, Pie,
 } from "recharts";
 
 /* ── Design tokens ───────────────────────────────────────────── */
@@ -80,9 +81,18 @@ function joinItems(items) {
 }
 
 async function parseAirBankPdf(file) {
-  const pdfjs = await import("pdfjs-dist");
+  // polyfill pro starší Safari (< 17.4)
+  if (!Promise.withResolvers) {
+    Promise.withResolvers = function () {
+      let resolve, reject;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      return { promise, resolve, reject };
+    };
+  }
+  // legacy build pdf.js – kompatibilní se staršími prohlížeči (Safari/WebKit)
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   try {
-    const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
+    const workerUrl = (await import("pdfjs-dist/legacy/build/pdf.worker.min.mjs?url")).default;
     pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
   } catch (e) { /* fallback bez workeru */ }
   const data = new Uint8Array(await file.arrayBuffer());
@@ -816,6 +826,54 @@ export default function DomaciFinance() {
 
   const sav = useMemo(() => savingsForMonth(month), [tx, month]);
 
+  /* ── derived: dashboard (napříč všemi účty) ── */
+  const dash = useMemo(() => {
+    const exp = inMonthAll.filter((t) => t.type === "expense");
+    const total = exp.reduce((s, t) => s + t.amount, 0);
+    const txCount = exp.length;
+    // kategorie za měsíc
+    const catMap = {};
+    exp.forEach((t) => { catMap[t.category] = (catMap[t.category] || 0) + t.amount; });
+    const pie = Object.entries(catMap).map(([name, value]) => ({ name, value: Math.round(value) }))
+      .sort((a, b) => b.value - a.value);
+    // top příjemci za měsíc
+    const payMap = {};
+    exp.forEach((t) => {
+      const key = (t.note || "").split(" · ")[0].trim() || t.category;
+      payMap[key] = (payMap[key] || 0) + t.amount;
+    });
+    const topPayees = Object.entries(payMap).map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value).slice(0, 8);
+    // podle účtů za měsíc
+    const accMap = {};
+    exp.forEach((t) => { accMap[t.account] = (accMap[t.account] || 0) + t.amount; });
+    const byAccount = Object.entries(accMap)
+      .map(([k, value]) => ({ name: ACCOUNTS[k]?.label ?? k, value }))
+      .sort((a, b) => b.value - a.value);
+    // skládaný trend 6 měsíců podle top kategorií
+    const [y, m] = month.split("-").map(Number);
+    const allCatTotals = {};
+    const monthsKeys = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(y, m - 1 - i, 1);
+      monthsKeys.push(monthKey(d));
+    }
+    tx.filter((t) => t.type === "expense" && monthsKeys.includes(t.date.slice(0, 7)))
+      .forEach((t) => { allCatTotals[t.category] = (allCatTotals[t.category] || 0) + t.amount; });
+    const topCats = Object.entries(allCatTotals).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([c]) => c);
+    const stack = monthsKeys.map((k) => {
+      const row = { name: MONTHS_SHORT[Number(k.slice(5, 7)) - 1] };
+      let other = 0;
+      tx.filter((t) => t.type === "expense" && t.date.slice(0, 7) === k).forEach((t) => {
+        if (topCats.includes(t.category)) row[t.category] = Math.round((row[t.category] || 0) + t.amount);
+        else other += t.amount;
+      });
+      if (other > 0) row["Ostatní kategorie"] = Math.round(other);
+      return row;
+    });
+    return { total, txCount, pie, topPayees, byAccount, stack, topCats };
+  }, [inMonthAll, tx, month]);
+
   /* ── derived: hypotéka (amortizační odhad k vybranému měsíci) ── */
   const mortInfo = useMemo(() => {
     if (!mortgage || !mortgage.balance || !mortgage.rate || !mortgage.payment) return null;
@@ -964,6 +1022,7 @@ export default function DomaciFinance() {
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <TabBtn active={tab === "prehled"} onClick={() => setTab("prehled")}>Přehled</TabBtn>
+            <TabBtn active={tab === "dashboard"} onClick={() => setTab("dashboard")}>Dashboard</TabBtn>
             <TabBtn active={tab === "sporeni"} onClick={() => setTab("sporeni")}>Spoření</TabBtn>
             <TabBtn active={tab === "bydleni"} onClick={() => setTab("bydleni")}>Bydlení</TabBtn>
             <TabBtn active={tab === "import"} onClick={() => setTab("import")}>
@@ -1159,6 +1218,108 @@ export default function DomaciFinance() {
             </section>
           );
         })}
+
+        {/* ══ DASHBOARD ══ */}
+        {tab === "dashboard" && (
+          <>
+            {monthNav}
+            <section style={{ ...card, marginTop: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 16 }}>
+                <Stat label="Výdaje celkem" value={czk(dash.total)} color={T.expense} />
+                <Stat label="Největší kategorie" value={dash.pie[0]?.name ?? "–"} color={CAT_COLORS[dash.pie[0]?.name] ?? T.ink} />
+                <Stat label="Transakcí" value={String(dash.txCount)} color={T.ink} />
+                <Stat label="Průměr / den" value={czk(dash.total / 30)} color={T.inkSoft} />
+              </div>
+              <p style={{ fontSize: 12, color: T.inkSoft, margin: "10px 0 0" }}>
+                Výdaje napříč všemi účty; převody mezi vlastními účty se nepočítají.
+              </p>
+            </section>
+
+            <section style={{ ...card, marginTop: 16 }}>
+              <h2 style={h2}>Výdaje podle kategorií — {monthLabel(month)}</h2>
+              {dash.pie.length === 0 ? (
+                <p style={{ fontSize: 13, color: T.inkSoft }}>Žádné výdaje v tomto měsíci.</p>
+              ) : (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 16, alignItems: "center" }}>
+                  <div style={{ width: 230, height: 230, flexShrink: 0 }}>
+                    <ResponsiveContainer>
+                      <PieChart>
+                        <Pie data={dash.pie} dataKey="value" nameKey="name" innerRadius={60} outerRadius={105}
+                          paddingAngle={1} strokeWidth={1}>
+                          {dash.pie.map((e) => <Cell key={e.name} fill={CAT_COLORS[e.name] ?? "#8C9A94"} />)}
+                        </Pie>
+                        <Tooltip formatter={(v) => czk(v)}
+                          contentStyle={{ borderRadius: 10, border: `1px solid ${T.line}`, fontSize: 13 }} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div style={{ flex: "1 1 260px", minWidth: 0 }}>
+                    {dash.pie.slice(0, 9).map((e) => (
+                      <div key={e.name} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, padding: "3px 0" }}>
+                        <span style={{ width: 10, height: 10, borderRadius: 3, background: CAT_COLORS[e.name] ?? "#8C9A94", flexShrink: 0 }} />
+                        <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.name}</span>
+                        <span className="mono" style={{ color: T.inkSoft }}>
+                          {czk(e.value)} · {dash.total > 0 ? Math.round((e.value / dash.total) * 100) : 0} %
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </section>
+
+            <section style={{ ...card, marginTop: 16 }}>
+              <h2 style={h2}>Skladba výdajů — posledních 6 měsíců</h2>
+              <div style={{ width: "100%", height: 260 }}>
+                <ResponsiveContainer>
+                  <BarChart data={dash.stack} margin={{ top: 8, right: 8, left: 8, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={T.line} vertical={false} />
+                    <XAxis dataKey="name" tick={{ fontSize: 12, fill: T.inkSoft }} axisLine={false} tickLine={false} />
+                    <YAxis tick={{ fontSize: 11, fill: T.inkSoft }} axisLine={false} tickLine={false}
+                      tickFormatter={(v) => (v >= 1000 ? `${Math.round(v / 1000)}k` : v)} width={44} />
+                    <Tooltip formatter={(v) => czk(v)} cursor={{ fill: "#EDF1EC" }}
+                      contentStyle={{ borderRadius: 10, border: `1px solid ${T.line}`, fontSize: 13 }} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                    {dash.topCats.map((c) => (
+                      <Bar key={c} dataKey={c} stackId="v" fill={CAT_COLORS[c] ?? "#8C9A94"} />
+                    ))}
+                    <Bar dataKey="Ostatní kategorie" stackId="v" fill="#C9D2CC" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+
+            <section style={{ ...card, marginTop: 16 }}>
+              <h2 style={h2}>Největší příjemci — {monthLabel(month)}</h2>
+              {dash.topPayees.map((p) => {
+                const share = dash.topPayees[0] ? p.value / dash.topPayees[0].value : 0;
+                return (
+                  <div key={p.name} style={{ marginTop: 10 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 3 }}>
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", paddingRight: 8 }}>{p.name}</span>
+                      <span className="mono" style={{ color: T.inkSoft }}>{czk(p.value)}</span>
+                    </div>
+                    <div style={{ height: 8, borderRadius: 4, background: "#EDF1EC", overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${Math.max(share * 100, 2)}%`, background: T.expense,
+                        opacity: 0.45 + share * 0.55, transition: "width .4s ease" }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </section>
+
+            <section style={{ ...card, marginTop: 16 }}>
+              <h2 style={h2}>Výdaje podle účtů — {monthLabel(month)}</h2>
+              {dash.byAccount.map((a) => (
+                <div key={a.name} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "7px 0",
+                  borderBottom: `1px solid ${T.line}` }}>
+                  <span>{a.name}</span>
+                  <span className="mono" style={{ fontWeight: 600 }}>{czk(a.value)}</span>
+                </div>
+              ))}
+            </section>
+          </>
+        )}
 
         {/* ══ SPOŘENÍ ══ */}
         {tab === "sporeni" && (

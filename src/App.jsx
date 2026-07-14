@@ -93,9 +93,18 @@ function joinItems(items) {
 }
 
 async function parseAirBankPdf(file) {
-  const pdfjs = await import("pdfjs-dist");
+  // polyfill pro starší Safari (< 17.4)
+  if (!Promise.withResolvers) {
+    Promise.withResolvers = function () {
+      let resolve, reject;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      return { promise, resolve, reject };
+    };
+  }
+  // legacy build pdf.js – kompatibilní se staršími prohlížeči (Safari/WebKit)
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   try {
-    const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
+    const workerUrl = (await import("pdfjs-dist/legacy/build/pdf.worker.min.mjs?url")).default;
     pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
   } catch (e) { /* fallback bez workeru */ }
   const data = new Uint8Array(await file.arrayBuffer());

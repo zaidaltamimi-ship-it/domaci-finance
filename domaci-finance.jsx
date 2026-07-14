@@ -39,19 +39,6 @@ const isSavings = (acc) => ACCOUNTS[acc]?.kind === "savings";
 
 const STORAGE_KEY = "domaci-finance-v2";
 const OLD_KEY = "domaci-finance-v1";
-
-/* Lokální úložiště – data zůstávají jen v tomto prohlížeči/telefonu. */
-const storage = {
-  async get(key) {
-    const value = localStorage.getItem(key);
-    if (value === null) throw new Error("key not found: " + key);
-    return { key, value };
-  },
-  async set(key, value) {
-    localStorage.setItem(key, value);
-    return { key, value };
-  },
-};
 const LOCK_KEY = "domaci-finance-lock";
 
 /* ── šifrování dat PIN kódem (PBKDF2 → AES-GCM) ──
@@ -513,7 +500,7 @@ export default function DomaciFinance() {
     (async () => {
       // 1) je nastavený zámek? -> zamknout a čekat na PIN
       try {
-        const l = await storage.get(LOCK_KEY);
+        const l = await window.storage.get(LOCK_KEY);
         if (l && l.value) {
           const conf = JSON.parse(l.value);
           if (conf && conf.salt) {
@@ -523,11 +510,11 @@ export default function DomaciFinance() {
       } catch (e) { /* zámek není */ }
       // 2) běžné načtení (nešifrovaná data)
       try {
-        const r = await storage.get(STORAGE_KEY);
+        const r = await window.storage.get(STORAGE_KEY);
         if (r && r.value) { applyLoaded(JSON.parse(r.value)); setLoading(false); return; }
       } catch (e) { /* v2 zatím neexistuje */ }
       try {
-        const old = await storage.get(OLD_KEY);
+        const old = await window.storage.get(OLD_KEY);
         if (old && old.value) {
           const d = JSON.parse(old.value);
           const migrated = (d.transactions || []).map((t) => ({
@@ -536,7 +523,7 @@ export default function DomaciFinance() {
             counter: t.type === "transfer" ? "bezny" : null,
           }));
           applyLoaded({ ...d, transactions: migrated });
-          await storage.set(STORAGE_KEY, JSON.stringify({
+          await window.storage.set(STORAGE_KEY, JSON.stringify({
             transactions: migrated, budgets: d.budgets || {},
             importedBatches: d.importedBatches || [], savingsGoal: null,
           }));
@@ -551,7 +538,7 @@ export default function DomaciFinance() {
       setSaveError(false);
       const obj = currentDataObj(patch);
       const value = cryptoKey ? await encryptJSON(cryptoKey, obj) : JSON.stringify(obj);
-      await storage.set(STORAGE_KEY, value);
+      await window.storage.set(STORAGE_KEY, value);
     } catch (e) { setSaveError(true); }
   };
 
@@ -560,7 +547,7 @@ export default function DomaciFinance() {
     setPinError("");
     try {
       const key = await deriveKey(pinInput, lockSalt);
-      const r = await storage.get(STORAGE_KEY);
+      const r = await window.storage.get(STORAGE_KEY);
       const d = await decryptJSON(key, r.value);
       applyLoaded(d);
       setCryptoKey(key); setLockScreen(false); setPinInput(""); setWipeArm(false);
@@ -574,8 +561,8 @@ export default function DomaciFinance() {
     try {
       const salt = b64(crypto.getRandomValues(new Uint8Array(16)));
       const key = await deriveKey(pinA, salt);
-      await storage.set(STORAGE_KEY, await encryptJSON(key, currentDataObj()));
-      await storage.set(LOCK_KEY, JSON.stringify({ salt }));
+      await window.storage.set(STORAGE_KEY, await encryptJSON(key, currentDataObj()));
+      await window.storage.set(LOCK_KEY, JSON.stringify({ salt }));
       setLockSalt(salt); setCryptoKey(key); setPinA(""); setPinB("");
       setSecMsg("Zámek je aktivní. PIN si dobře zapamatuj – bez něj data nelze obnovit.");
     } catch (e) { setSecMsg("Aktivace zámku se nepovedla."); }
@@ -583,8 +570,8 @@ export default function DomaciFinance() {
 
   const disableLock = async () => {
     try {
-      await storage.set(STORAGE_KEY, JSON.stringify(currentDataObj()));
-      await storage.set(LOCK_KEY, JSON.stringify({ salt: null }));
+      await window.storage.set(STORAGE_KEY, JSON.stringify(currentDataObj()));
+      await window.storage.set(LOCK_KEY, JSON.stringify({ salt: null }));
       setLockSalt(null); setCryptoKey(null); setSecMsg("Zámek zrušen, data jsou uložena nešifrovaně.");
     } catch (e) { setSecMsg("Zrušení zámku se nepovedlo."); }
   };
@@ -600,8 +587,8 @@ export default function DomaciFinance() {
   const wipeAll = async () => {
     if (!wipeArm) { setWipeArm(true); return; }
     try {
-      await storage.set(STORAGE_KEY, JSON.stringify({ transactions: [], budgets: {}, importedBatches: [] }));
-      await storage.set(LOCK_KEY, JSON.stringify({ salt: null }));
+      await window.storage.set(STORAGE_KEY, JSON.stringify({ transactions: [], budgets: {}, importedBatches: [] }));
+      await window.storage.set(LOCK_KEY, JSON.stringify({ salt: null }));
       resetStates(); setLockSalt(null); setCryptoKey(null);
       setLockScreen(false); setWipeArm(false); setPinInput(""); setPinError("");
     } catch (e) { setPinError("Smazání se nepovedlo."); }

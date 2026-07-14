@@ -2,6 +2,8 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
 
+// POZOR: base musí odpovídat názvu GitHub repozitáře!
+// Appka pak poběží na https://<uzivatel>.github.io/domaci-finance/
 export default defineConfig({
   base: "/domaci-finance/",
   plugins: [
@@ -22,8 +24,8 @@ export default defineConfig({
         icons: [
           { src: "icon-192.png", sizes: "192x192", type: "image/png" },
           { src: "icon-512.png", sizes: "512x512", type: "image/png" },
-          { src: "icon-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" }
-        ]
+          { src: "icon-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
+        ],
       },
       workbox: {
         globPatterns: ["**/*.{js,css,html,png,svg,woff2}"],
@@ -33,11 +35,11 @@ export default defineConfig({
             handler: "CacheFirst",
             options: {
               cacheName: "google-fonts",
-              expiration: { maxEntries: 20, maxAgeSeconds: 31536000 }
-            }
-          }
-        ]
-      }
-    })
-  ]
+              expiration: { maxEntries: 20, maxAgeSeconds: 60 * 60 * 24 * 365 },
+            },
+          },
+        ],
+      },
+    }),
+  ],
 });

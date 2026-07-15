@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from "react";
 import {
   BarChart, Bar, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid, ReferenceLine,
+  PieChart, Pie,
 } from "recharts";
 
 /* ── Design tokens ───────────────────────────────────────────── */
@@ -470,6 +471,7 @@ export default function DomaciFinance() {
     const m = {}; Object.entries(ACCOUNTS).forEach(([k, a]) => { if (a.num) m[a.num] = k; }); return m;
   });
   const [rulesLearned, setRulesLearned] = useState({});
+  const [collapsedBatches, setCollapsedBatches] = useState({});
   // frekvence plateb pro roční přepočet v reportu Bydlení (počet plateb za rok)
   const DEFAULT_FREQ = { "Středočeské vodárny – voda": 4 };
   const [freqOverrides, setFreqOverrides] = useState(DEFAULT_FREQ);
@@ -666,6 +668,30 @@ export default function DomaciFinance() {
     setPendingImport(null);
   };
 
+  /* označení duplicit: 1) podle bankovního kódu transakce, 2) podle obsahu
+     (účet + datum + částka) s počítáním výskytů – dvě reálné stejné platby
+     v jeden den se nesloučí */
+  const markDuplicates = (rows, accountKey) => {
+    const existingIds = new Set(tx.map((t) => t.id));
+    const sigCount = {};
+    if (accountKey) {
+      tx.filter((t) => t.account === accountKey).forEach((t) => {
+        const signed = t.type === "income" || (t.type === "transfer" && t.dir === "in") ? t.amount : -t.amount;
+        const sig = `${t.date}|${signed.toFixed(2)}`;
+        sigCount[sig] = (sigCount[sig] || 0) + 1;
+      });
+    }
+    return rows.map((r) => {
+      let dup = false;
+      if (r.code && existingIds.has(`ab-${r.code}`)) dup = true;
+      if (!dup && accountKey) {
+        const sig = `${r.date}|${r.amount.toFixed(2)}`;
+        if (sigCount[sig] > 0) { dup = true; sigCount[sig] -= 1; }
+      }
+      return dup ? { ...r, dup: true, include: false } : { ...r, dup: false };
+    });
+  };
+
   const handlePdfUpload = async (file) => {
     if (!file) return;
     setPdfBusy(true); setPdfMsg("");
@@ -676,9 +702,12 @@ export default function DomaciFinance() {
       if (uploadedBatches.some((b) => b.id === batch.id)) {
         setPdfMsg("Tento výpis už je nahraný níže."); setPdfBusy(false); return;
       }
-      setUploadedBatches([...uploadedBatches, batch]);
-      setImportState((s) => ({ ...s, [batch.id]: batch.rows }));
-      setPdfMsg(`Načteno ${batch.rows.length} transakcí (${monthLabel(parsed.month)}).`
+      const rowsMarked = markDuplicates(batch.rows, accountKey);
+      const dupCount = rowsMarked.filter((r) => r.dup).length;
+      setUploadedBatches([...uploadedBatches, { ...batch, rows: rowsMarked }]);
+      setImportState((s) => ({ ...s, [batch.id]: rowsMarked }));
+      setPdfMsg(`Načteno ${rowsMarked.length} transakcí (${monthLabel(parsed.month)})`
+        + (dupCount ? `, z toho ${dupCount} už v evidenci je – označeny jako duplicity a vynechány.` : ".")
         + (accountKey ? "" : " Neznámé číslo účtu – přiřaď ho níže."));
     } catch (e) {
       setPdfMsg(String(e?.message || "").includes("import")
@@ -690,7 +719,9 @@ export default function DomaciFinance() {
 
   const assignBatchAccount = (batchId, accountKey) => {
     const batch = uploadedBatches.find((b) => b.id === batchId);
-    setUploadedBatches(uploadedBatches.map((b) => b.id === batchId ? { ...b, account: accountKey } : b));
+    const rowsMarked = markDuplicates(importState[batchId] || batch?.rows || [], accountKey);
+    setUploadedBatches(uploadedBatches.map((b) => b.id === batchId ? { ...b, account: accountKey, rows: rowsMarked } : b));
+    setImportState((s) => ({ ...s, [batchId]: rowsMarked }));
     if (batch?.accountNum) {
       const next = { ...accountNums, [batch.accountNum]: accountKey };
       setAccountNums(next); persist({ accountNums: next });
@@ -837,6 +868,54 @@ export default function DomaciFinance() {
   };
 
   const sav = useMemo(() => savingsForMonth(month), [tx, month]);
+
+  /* ── derived: dashboard (napříč všemi účty) ── */
+  const dash = useMemo(() => {
+    const exp = inMonthAll.filter((t) => t.type === "expense");
+    const total = exp.reduce((s, t) => s + t.amount, 0);
+    const txCount = exp.length;
+    // kategorie za měsíc
+    const catMap = {};
+    exp.forEach((t) => { catMap[t.category] = (catMap[t.category] || 0) + t.amount; });
+    const pie = Object.entries(catMap).map(([name, value]) => ({ name, value: Math.round(value) }))
+      .sort((a, b) => b.value - a.value);
+    // top příjemci za měsíc
+    const payMap = {};
+    exp.forEach((t) => {
+      const key = (t.note || "").split(" · ")[0].trim() || t.category;
+      payMap[key] = (payMap[key] || 0) + t.amount;
+    });
+    const topPayees = Object.entries(payMap).map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value).slice(0, 8);
+    // podle účtů za měsíc
+    const accMap = {};
+    exp.forEach((t) => { accMap[t.account] = (accMap[t.account] || 0) + t.amount; });
+    const byAccount = Object.entries(accMap)
+      .map(([k, value]) => ({ name: ACCOUNTS[k]?.label ?? k, value }))
+      .sort((a, b) => b.value - a.value);
+    // skládaný trend 6 měsíců podle top kategorií
+    const [y, m] = month.split("-").map(Number);
+    const allCatTotals = {};
+    const monthsKeys = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(y, m - 1 - i, 1);
+      monthsKeys.push(monthKey(d));
+    }
+    tx.filter((t) => t.type === "expense" && monthsKeys.includes(t.date.slice(0, 7)))
+      .forEach((t) => { allCatTotals[t.category] = (allCatTotals[t.category] || 0) + t.amount; });
+    const topCats = Object.entries(allCatTotals).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([c]) => c);
+    const stack = monthsKeys.map((k) => {
+      const row = { name: MONTHS_SHORT[Number(k.slice(5, 7)) - 1] };
+      let other = 0;
+      tx.filter((t) => t.type === "expense" && t.date.slice(0, 7) === k).forEach((t) => {
+        if (topCats.includes(t.category)) row[t.category] = Math.round((row[t.category] || 0) + t.amount);
+        else other += t.amount;
+      });
+      if (other > 0) row["Ostatní kategorie"] = Math.round(other);
+      return row;
+    });
+    return { total, txCount, pie, topPayees, byAccount, stack, topCats };
+  }, [inMonthAll, tx, month]);
 
   /* ── derived: hypotéka (amortizační odhad k vybranému měsíci) ── */
   const mortInfo = useMemo(() => {
@@ -986,6 +1065,7 @@ export default function DomaciFinance() {
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <TabBtn active={tab === "prehled"} onClick={() => setTab("prehled")}>Přehled</TabBtn>
+            <TabBtn active={tab === "dashboard"} onClick={() => setTab("dashboard")}>Dashboard</TabBtn>
             <TabBtn active={tab === "sporeni"} onClick={() => setTab("sporeni")}>Spoření</TabBtn>
             <TabBtn active={tab === "bydleni"} onClick={() => setTab("bydleni")}>Bydlení</TabBtn>
             <TabBtn active={tab === "import"} onClick={() => setTab("import")}>
@@ -1094,25 +1174,42 @@ export default function DomaciFinance() {
           const rows = importState[batch.id] || [];
           const included = rows.filter((r) => r.include);
           const done = importedBatches.includes(batch.id);
+          const dupCount = rows.filter((r) => r.dup).length;
+          const visRows = rows.filter((r) => !r.dup);
+          const collapsed = collapsedBatches[batch.id] ?? done;
+          const toggleCollapse = () => setCollapsedBatches({ ...collapsedBatches, [batch.id]: !collapsed });
           const inc = included.filter((r) => r.amount > 0 && r.cat !== TRANSFER_CAT).reduce((s, r) => s + r.amount, 0);
           const exp = included.filter((r) => r.amount < 0 && r.cat !== TRANSFER_CAT).reduce((s, r) => s - r.amount, 0);
           const trn = included.filter((r) => r.cat === TRANSFER_CAT).reduce((s, r) => s + Math.abs(r.amount), 0);
           return (
             <section key={batch.id} style={{ ...card, marginTop: 16 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap", gap: 8 }}>
-                <h2 style={{ ...h2, margin: 0 }}>{batch.label}{done ? " ✓" : ""}</h2>
+              <div onClick={toggleCollapse} role="button" aria-expanded={!collapsed}
+                style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap", gap: 8, cursor: "pointer" }}>
+                <h2 style={{ ...h2, margin: 0 }}>
+                  <span style={{ display: "inline-block", width: 16, color: T.inkSoft }}>{collapsed ? "▸" : "▾"}</span>
+                  {batch.label}{done ? " ✓" : ""}
+                  <span style={{ fontWeight: 400, fontSize: 12, color: T.inkSoft, marginLeft: 8 }}>
+                    {visRows.length} záznamů
+                  </span>
+                </h2>
                 <div style={{ display: "flex", gap: 16, fontSize: 13 }} className="mono">
                   <span style={{ color: T.income }}>+{czk(inc)}</span>
                   <span style={{ color: T.expense }}>−{czk2(exp)}</span>
                   <span style={{ color: T.transfer }}>⇄ {czk(trn)}</span>
                 </div>
               </div>
-              {done && (
+              {!collapsed && done && (
                 <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 10, background: T.amberSoft, color: "#8A6414", fontSize: 13 }}>
                   Tento výpis už byl importován. Opakovaný import by vytvořil duplicitní záznamy.
                 </div>
               )}
-              {batch.uploaded && !batch.account && (
+              {!collapsed && dupCount > 0 && (
+                <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 10, background: "#F0F3EF",
+                  color: T.inkSoft, fontSize: 13 }}>
+                  {dupCount === 1 ? "1 duplicitní záznam skryt" : `${dupCount} duplicitních záznamů skryto`} – v evidenci už jsou, znovu se nenaimportují.
+                </div>
+              )}
+              {!collapsed && batch.uploaded && !batch.account && (
                 <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 10, background: T.amberSoft, fontSize: 13,
                   display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <span>Neznámé číslo účtu <strong>{batch.accountNum}</strong> – ke kterému účtu patří?</span>
@@ -1123,8 +1220,8 @@ export default function DomaciFinance() {
                   </select>
                 </div>
               )}
-              <div style={{ marginTop: 6 }}>
-                {rows.map((r) => (
+              {!collapsed && <div style={{ marginTop: 6 }}>
+                {visRows.map((r) => (
                   <div key={r.key} style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap",
                     padding: "8px 0", borderBottom: `1px solid ${T.line}`, opacity: r.include ? 1 : 0.45 }}>
                     <input type="checkbox" checked={r.include} aria-label="Zahrnout do importu"
@@ -1139,6 +1236,7 @@ export default function DomaciFinance() {
                               [batch.id]: rows.map((x) => x.key === r.key ? { ...x, recurring: !x.recurring } : x) })} />
                         )}
                         {r.unsure && <Badge kind="unsure">ověřit</Badge>}
+                        {r.dup && <Badge kind="dup">duplicita</Badge>}
                       </div>
                       <div style={{ fontSize: 12, color: T.inkSoft }}>
                         {new Date(r.date + "T00:00").toLocaleDateString("cs-CZ")}{r.note ? ` · ${r.note}` : ""}
@@ -1173,14 +1271,118 @@ export default function DomaciFinance() {
                     </div>
                   </div>
                 ))}
-              </div>
-              <button onClick={() => confirmImport(batch)} disabled={included.length === 0 || done || (batch.uploaded && !batch.account)}
-                style={{ ...primaryBtn, marginTop: 14, background: T.income, opacity: included.length === 0 || done ? 0.5 : 1 }}>
-                {done ? "Importováno" : `Importovat ${included.length} záznamů`}
-              </button>
+              </div>}
+              {!collapsed && (
+                <button onClick={() => confirmImport(batch)} disabled={included.length === 0 || done || (batch.uploaded && !batch.account)}
+                  style={{ ...primaryBtn, marginTop: 14, background: T.income, opacity: included.length === 0 || done || (batch.uploaded && !batch.account) ? 0.5 : 1 }}>
+                  {done ? "Importováno" : `Importovat ${included.length} záznamů`}
+                </button>
+              )}
             </section>
           );
         })}
+
+        {/* ══ DASHBOARD ══ */}
+        {tab === "dashboard" && (
+          <>
+            {monthNav}
+            <section style={{ ...card, marginTop: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 16 }}>
+                <Stat label="Výdaje celkem" value={czk(dash.total)} color={T.expense} />
+                <Stat label="Největší kategorie" value={dash.pie[0]?.name ?? "–"} color={CAT_COLORS[dash.pie[0]?.name] ?? T.ink} />
+                <Stat label="Transakcí" value={String(dash.txCount)} color={T.ink} />
+                <Stat label="Průměr / den" value={czk(dash.total / 30)} color={T.inkSoft} />
+              </div>
+              <p style={{ fontSize: 12, color: T.inkSoft, margin: "10px 0 0" }}>
+                Výdaje napříč všemi účty; převody mezi vlastními účty se nepočítají.
+              </p>
+            </section>
+
+            <section style={{ ...card, marginTop: 16 }}>
+              <h2 style={h2}>Výdaje podle kategorií — {monthLabel(month)}</h2>
+              {dash.pie.length === 0 ? (
+                <p style={{ fontSize: 13, color: T.inkSoft }}>Žádné výdaje v tomto měsíci.</p>
+              ) : (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 16, alignItems: "center" }}>
+                  <div style={{ width: 230, height: 230, flexShrink: 0 }}>
+                    <ResponsiveContainer>
+                      <PieChart>
+                        <Pie data={dash.pie} dataKey="value" nameKey="name" innerRadius={60} outerRadius={105}
+                          paddingAngle={1} strokeWidth={1}>
+                          {dash.pie.map((e) => <Cell key={e.name} fill={CAT_COLORS[e.name] ?? "#8C9A94"} />)}
+                        </Pie>
+                        <Tooltip formatter={(v) => czk(v)}
+                          contentStyle={{ borderRadius: 10, border: `1px solid ${T.line}`, fontSize: 13 }} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div style={{ flex: "1 1 260px", minWidth: 0 }}>
+                    {dash.pie.slice(0, 9).map((e) => (
+                      <div key={e.name} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, padding: "3px 0" }}>
+                        <span style={{ width: 10, height: 10, borderRadius: 3, background: CAT_COLORS[e.name] ?? "#8C9A94", flexShrink: 0 }} />
+                        <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.name}</span>
+                        <span className="mono" style={{ color: T.inkSoft }}>
+                          {czk(e.value)} · {dash.total > 0 ? Math.round((e.value / dash.total) * 100) : 0} %
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </section>
+
+            <section style={{ ...card, marginTop: 16 }}>
+              <h2 style={h2}>Skladba výdajů — posledních 6 měsíců</h2>
+              <div style={{ width: "100%", height: 260 }}>
+                <ResponsiveContainer>
+                  <BarChart data={dash.stack} margin={{ top: 8, right: 8, left: 8, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={T.line} vertical={false} />
+                    <XAxis dataKey="name" tick={{ fontSize: 12, fill: T.inkSoft }} axisLine={false} tickLine={false} />
+                    <YAxis tick={{ fontSize: 11, fill: T.inkSoft }} axisLine={false} tickLine={false}
+                      tickFormatter={(v) => (v >= 1000 ? `${Math.round(v / 1000)}k` : v)} width={44} />
+                    <Tooltip formatter={(v) => czk(v)} cursor={{ fill: "#EDF1EC" }}
+                      contentStyle={{ borderRadius: 10, border: `1px solid ${T.line}`, fontSize: 13 }} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                    {dash.topCats.map((c) => (
+                      <Bar key={c} dataKey={c} stackId="v" fill={CAT_COLORS[c] ?? "#8C9A94"} />
+                    ))}
+                    <Bar dataKey="Ostatní kategorie" stackId="v" fill="#C9D2CC" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+
+            <section style={{ ...card, marginTop: 16 }}>
+              <h2 style={h2}>Největší příjemci — {monthLabel(month)}</h2>
+              {dash.topPayees.map((p) => {
+                const share = dash.topPayees[0] ? p.value / dash.topPayees[0].value : 0;
+                return (
+                  <div key={p.name} style={{ marginTop: 10 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 3 }}>
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", paddingRight: 8 }}>{p.name}</span>
+                      <span className="mono" style={{ color: T.inkSoft }}>{czk(p.value)}</span>
+                    </div>
+                    <div style={{ height: 8, borderRadius: 4, background: "#EDF1EC", overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${Math.max(share * 100, 2)}%`, background: T.expense,
+                        opacity: 0.45 + share * 0.55, transition: "width .4s ease" }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </section>
+
+            <section style={{ ...card, marginTop: 16 }}>
+              <h2 style={h2}>Výdaje podle účtů — {monthLabel(month)}</h2>
+              {dash.byAccount.map((a) => (
+                <div key={a.name} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "7px 0",
+                  borderBottom: `1px solid ${T.line}` }}>
+                  <span>{a.name}</span>
+                  <span className="mono" style={{ fontWeight: 600 }}>{czk(a.value)}</span>
+                </div>
+              ))}
+            </section>
+          </>
+        )}
 
         {/* ══ SPOŘENÍ ══ */}
         {tab === "sporeni" && (
@@ -1624,7 +1826,8 @@ function RecurToggle({ value, onClick, disabled }) {
 }
 
 function Badge({ kind, children }) {
-  const styles = { recurring: { background: "#E3F0EA", color: "#1F6F54" }, unsure: { background: "#F8EFDC", color: "#8A6414" } }[kind];
+  const styles = { recurring: { background: "#E3F0EA", color: "#1F6F54" }, unsure: { background: "#F8EFDC", color: "#8A6414" },
+    dup: { background: "#F6E7E6", color: "#B0413E" } }[kind];
   return (
     <span style={{ ...styles, fontSize: 11, fontWeight: 600, borderRadius: 6, padding: "1px 7px", marginLeft: 6,
       verticalAlign: "1px", whiteSpace: "nowrap" }}>{children}</span>

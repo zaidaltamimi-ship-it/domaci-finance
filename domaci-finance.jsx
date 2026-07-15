@@ -458,6 +458,7 @@ export default function DomaciFinance() {
     const m = {}; Object.entries(ACCOUNTS).forEach(([k, a]) => { if (a.num) m[a.num] = k; }); return m;
   });
   const [rulesLearned, setRulesLearned] = useState({});
+  const [collapsedBatches, setCollapsedBatches] = useState({});
   // frekvence plateb pro roční přepočet v reportu Bydlení (počet plateb za rok)
   const DEFAULT_FREQ = { "Středočeské vodárny – voda": 4 };
   const [freqOverrides, setFreqOverrides] = useState(DEFAULT_FREQ);
@@ -654,6 +655,30 @@ export default function DomaciFinance() {
     setPendingImport(null);
   };
 
+  /* označení duplicit: 1) podle bankovního kódu transakce, 2) podle obsahu
+     (účet + datum + částka) s počítáním výskytů – dvě reálné stejné platby
+     v jeden den se nesloučí */
+  const markDuplicates = (rows, accountKey) => {
+    const existingIds = new Set(tx.map((t) => t.id));
+    const sigCount = {};
+    if (accountKey) {
+      tx.filter((t) => t.account === accountKey).forEach((t) => {
+        const signed = t.type === "income" || (t.type === "transfer" && t.dir === "in") ? t.amount : -t.amount;
+        const sig = `${t.date}|${signed.toFixed(2)}`;
+        sigCount[sig] = (sigCount[sig] || 0) + 1;
+      });
+    }
+    return rows.map((r) => {
+      let dup = false;
+      if (r.code && existingIds.has(`ab-${r.code}`)) dup = true;
+      if (!dup && accountKey) {
+        const sig = `${r.date}|${r.amount.toFixed(2)}`;
+        if (sigCount[sig] > 0) { dup = true; sigCount[sig] -= 1; }
+      }
+      return dup ? { ...r, dup: true, include: false } : { ...r, dup: false };
+    });
+  };
+
   const handlePdfUpload = async (file) => {
     if (!file) return;
     setPdfBusy(true); setPdfMsg("");
@@ -664,9 +689,12 @@ export default function DomaciFinance() {
       if (uploadedBatches.some((b) => b.id === batch.id)) {
         setPdfMsg("Tento výpis už je nahraný níže."); setPdfBusy(false); return;
       }
-      setUploadedBatches([...uploadedBatches, batch]);
-      setImportState((s) => ({ ...s, [batch.id]: batch.rows }));
-      setPdfMsg(`Načteno ${batch.rows.length} transakcí (${monthLabel(parsed.month)}).`
+      const rowsMarked = markDuplicates(batch.rows, accountKey);
+      const dupCount = rowsMarked.filter((r) => r.dup).length;
+      setUploadedBatches([...uploadedBatches, { ...batch, rows: rowsMarked }]);
+      setImportState((s) => ({ ...s, [batch.id]: rowsMarked }));
+      setPdfMsg(`Načteno ${rowsMarked.length} transakcí (${monthLabel(parsed.month)})`
+        + (dupCount ? `, z toho ${dupCount} už v evidenci je – označeny jako duplicity a vynechány.` : ".")
         + (accountKey ? "" : " Neznámé číslo účtu – přiřaď ho níže."));
     } catch (e) {
       setPdfMsg(String(e?.message || "").includes("import")
@@ -678,7 +706,9 @@ export default function DomaciFinance() {
 
   const assignBatchAccount = (batchId, accountKey) => {
     const batch = uploadedBatches.find((b) => b.id === batchId);
-    setUploadedBatches(uploadedBatches.map((b) => b.id === batchId ? { ...b, account: accountKey } : b));
+    const rowsMarked = markDuplicates(importState[batchId] || batch?.rows || [], accountKey);
+    setUploadedBatches(uploadedBatches.map((b) => b.id === batchId ? { ...b, account: accountKey, rows: rowsMarked } : b));
+    setImportState((s) => ({ ...s, [batchId]: rowsMarked }));
     if (batch?.accountNum) {
       const next = { ...accountNums, [batch.accountNum]: accountKey };
       setAccountNums(next); persist({ accountNums: next });
@@ -1131,25 +1161,42 @@ export default function DomaciFinance() {
           const rows = importState[batch.id] || [];
           const included = rows.filter((r) => r.include);
           const done = importedBatches.includes(batch.id);
+          const dupCount = rows.filter((r) => r.dup).length;
+          const visRows = rows.filter((r) => !r.dup);
+          const collapsed = collapsedBatches[batch.id] ?? done;
+          const toggleCollapse = () => setCollapsedBatches({ ...collapsedBatches, [batch.id]: !collapsed });
           const inc = included.filter((r) => r.amount > 0 && r.cat !== TRANSFER_CAT).reduce((s, r) => s + r.amount, 0);
           const exp = included.filter((r) => r.amount < 0 && r.cat !== TRANSFER_CAT).reduce((s, r) => s - r.amount, 0);
           const trn = included.filter((r) => r.cat === TRANSFER_CAT).reduce((s, r) => s + Math.abs(r.amount), 0);
           return (
             <section key={batch.id} style={{ ...card, marginTop: 16 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap", gap: 8 }}>
-                <h2 style={{ ...h2, margin: 0 }}>{batch.label}{done ? " ✓" : ""}</h2>
+              <div onClick={toggleCollapse} role="button" aria-expanded={!collapsed}
+                style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap", gap: 8, cursor: "pointer" }}>
+                <h2 style={{ ...h2, margin: 0 }}>
+                  <span style={{ display: "inline-block", width: 16, color: T.inkSoft }}>{collapsed ? "▸" : "▾"}</span>
+                  {batch.label}{done ? " ✓" : ""}
+                  <span style={{ fontWeight: 400, fontSize: 12, color: T.inkSoft, marginLeft: 8 }}>
+                    {visRows.length} záznamů
+                  </span>
+                </h2>
                 <div style={{ display: "flex", gap: 16, fontSize: 13 }} className="mono">
                   <span style={{ color: T.income }}>+{czk(inc)}</span>
                   <span style={{ color: T.expense }}>−{czk2(exp)}</span>
                   <span style={{ color: T.transfer }}>⇄ {czk(trn)}</span>
                 </div>
               </div>
-              {done && (
+              {!collapsed && done && (
                 <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 10, background: T.amberSoft, color: "#8A6414", fontSize: 13 }}>
                   Tento výpis už byl importován. Opakovaný import by vytvořil duplicitní záznamy.
                 </div>
               )}
-              {batch.uploaded && !batch.account && (
+              {!collapsed && dupCount > 0 && (
+                <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 10, background: "#F0F3EF",
+                  color: T.inkSoft, fontSize: 13 }}>
+                  {dupCount === 1 ? "1 duplicitní záznam skryt" : `${dupCount} duplicitních záznamů skryto`} – v evidenci už jsou, znovu se nenaimportují.
+                </div>
+              )}
+              {!collapsed && batch.uploaded && !batch.account && (
                 <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 10, background: T.amberSoft, fontSize: 13,
                   display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <span>Neznámé číslo účtu <strong>{batch.accountNum}</strong> – ke kterému účtu patří?</span>
@@ -1160,8 +1207,8 @@ export default function DomaciFinance() {
                   </select>
                 </div>
               )}
-              <div style={{ marginTop: 6 }}>
-                {rows.map((r) => (
+              {!collapsed && <div style={{ marginTop: 6 }}>
+                {visRows.map((r) => (
                   <div key={r.key} style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap",
                     padding: "8px 0", borderBottom: `1px solid ${T.line}`, opacity: r.include ? 1 : 0.45 }}>
                     <input type="checkbox" checked={r.include} aria-label="Zahrnout do importu"
@@ -1176,6 +1223,7 @@ export default function DomaciFinance() {
                               [batch.id]: rows.map((x) => x.key === r.key ? { ...x, recurring: !x.recurring } : x) })} />
                         )}
                         {r.unsure && <Badge kind="unsure">ověřit</Badge>}
+                        {r.dup && <Badge kind="dup">duplicita</Badge>}
                       </div>
                       <div style={{ fontSize: 12, color: T.inkSoft }}>
                         {new Date(r.date + "T00:00").toLocaleDateString("cs-CZ")}{r.note ? ` · ${r.note}` : ""}
@@ -1210,11 +1258,13 @@ export default function DomaciFinance() {
                     </div>
                   </div>
                 ))}
-              </div>
-              <button onClick={() => confirmImport(batch)} disabled={included.length === 0 || done || (batch.uploaded && !batch.account)}
-                style={{ ...primaryBtn, marginTop: 14, background: T.income, opacity: included.length === 0 || done ? 0.5 : 1 }}>
-                {done ? "Importováno" : `Importovat ${included.length} záznamů`}
-              </button>
+              </div>}
+              {!collapsed && (
+                <button onClick={() => confirmImport(batch)} disabled={included.length === 0 || done || (batch.uploaded && !batch.account)}
+                  style={{ ...primaryBtn, marginTop: 14, background: T.income, opacity: included.length === 0 || done || (batch.uploaded && !batch.account) ? 0.5 : 1 }}>
+                  {done ? "Importováno" : `Importovat ${included.length} záznamů`}
+                </button>
+              )}
             </section>
           );
         })}
@@ -1763,7 +1813,8 @@ function RecurToggle({ value, onClick, disabled }) {
 }
 
 function Badge({ kind, children }) {
-  const styles = { recurring: { background: "#E3F0EA", color: "#1F6F54" }, unsure: { background: "#F8EFDC", color: "#8A6414" } }[kind];
+  const styles = { recurring: { background: "#E3F0EA", color: "#1F6F54" }, unsure: { background: "#F8EFDC", color: "#8A6414" },
+    dup: { background: "#F6E7E6", color: "#B0413E" } }[kind];
   return (
     <span style={{ ...styles, fontSize: 11, fontWeight: 600, borderRadius: 6, padding: "1px 7px", marginLeft: 6,
       verticalAlign: "1px", whiteSpace: "nowrap" }}>{children}</span>
